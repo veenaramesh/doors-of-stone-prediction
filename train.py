@@ -1,67 +1,89 @@
-import glob
-import utils
-import pickle
+from __future__ import print_function
 import numpy as np
 import tensorflow as tf
 
-PATH = glob.glob("/data/*.txt")
+import argparse
+import time
+import os
+from six.moves import cPickle
 
-# HYPER PARAMETERS
-EPOCHS = 10000
-BATCH_SIZE = 512
-RNN_SIZE = 512
-LAYERS = 3
-KEEP_PROBABILITY = 0.7
-EMBED_DIM = 512
-SEQUENCE_LENGTH = 30
-LEARNING_RATE = 0.001
-OUTPUT_DIR = './output'
+from utils import TextLoader
+from model import Model
 
+def prepare_input():
+    filenames = ['data/name_of_the_wind.txt', 'data/wise_man_fear.txt']
+    with open('data/input.txt', 'w') as outfile:
+        for fname in filenames:
+            with open(fname) as infile:
+                for line in infile:
+                    outfile.write(line)
 
-corpus_raw = utils.combine_books(PATH)
+def main():
 
-## PRE PROCESSING ##
-token_dict = utils.token_lookup()
-for token, replacement in token_dict.items():
-    corpus_raw = corpus_raw.replace(token, ' {} '.format(replacement))
-corpus_raw = corpus_raw.lower()
-corpus_raw = corpus_raw.split()
+    prepare_input()
 
-vocab_to_int, int_to_vocab = utils.create_lookup_tables(corpus_raw)
-corpus_int = [vocab_to_int[word] for word in corpus_raw]
-pickle.dump((corpus_int, vocab_to_int, int_to_vocab, token_dict), open('preprocess.p', 'wb'))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, default='data/')
+    parser.add_argument('--input_encoding', type=str, default=None)
+    parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--rnn_size', type=int, default=256)
+    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--model', type=str, default='lstm')
+    parser.add_argument('--batch_size', type=int, default=50)
+    parser.add_argument('--seq_length', type=int, default=25)
+    parser.add_argument('--num_epochs', type=int, default=50)
+    parser.add_argument('--save_every', type=int, default=1000)
+    parser.add_argument('--grad_clip', type=float, default=5.)
+    parser.add_argument('--learning_rate', type=float, default=0.002)
+    parser.add_argument('--decay_rate', type=float, default=0.97)
+    parser.add_argument('--gpu_mem', type=float, default=0.666)
+    args = parser.parse_args()
+    train(args)
 
-## BUILDING NETWORK ##
+def train(args):
+    data_loader = TextLoader(args.data_dir, args.batch_size, args.seq_length, args.input_encoding)
+    args.vocab_size = data_loader.vocab_size
 
-train_graph = tf.Graph()
-with train_graph.as_default():
-    input_text = tf.placeholder(tf.int32, [None, None], name='input')
-    targets = tf.placeholder(tf.int32, [None, None], name='targets')
-    lr = tf.placeholder(tf.float32, name='learning_rate')
+    with open(os.path.join(args.save_dir, 'config.pkl'), 'wb') as f:
+        cPickle.dump(args, f)
+    with open(os.path.join(args.save_dir, 'words_vocab.pkl'), 'wb') as f:
+        cPickle.dump((data_loader.words, data_loader.vocab), f)
 
-    vocab_size = len(int_to_vocab)
-    input_text_shape = tf.shape(input_text)
+    model = Model(args)
 
-    lstm = tf.contrib.rnn.BasicLSTMCell(num_units=RNN_SIZE)
-    drop_cell = tf.contrib.rnn.DropoutWrapper(lstm, output_keep_prob=KEEP_PROBABILITY)
-    cell = tf.contrib.rnn.MultiRNNCell([drop_cell] * LAYERS)
+    merged = tf.summary.merge_all()
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_mem)
 
-    initialize = cell.zero_state(input_text_shpae[0], tf.float32)
-    intialize = tf.identity(initialize, name='intial_state')
+    with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
+        tf.global_variables_initializer().run()
+        saver = tf.train.Saver(tf.global_variables())
 
-    embed = tf.contrib.layers.embed_sequence(input_text, vocab_size, EMBED_DIM)
+        for e in range(model.epoch_pointer.eval(), args.num_epochs):
+            sess.run(tf.assign(model.lr, args.learning_rate * (args.decay_rate ** e)))
+            data_loader.reset_batch_pointer()
+            state = sess.run(model.initial_state)
+            speed = 0
+            assign_op = model.epoch_pointer.assign(e)
+            sess.run(assign_op)
 
-    outputs, final_state = tf.nn.dynamic_rnn(cell, embed, dtype=tf.float32)
-    final_state = tf.identity(final_state, name='final_state')
+            for b in range(data_loader.pointer, data_loader.num_batches):
+                start = time.time()
+                x, y = data_loader.next_batch()
+                feed = {model.input_data: x, model.targets: y, model.initial_state: state,
+                        model.batch_time: speed}
+                summary, train_loss, state, _, _ = sess.run([merged, model.cost, model.final_state,
+                                                             model.train_op, model.inc_batch_pointer_op], feed)
+                speed = time.time() - start
+                if (e * data_loader.num_batches + b) % args.batch_size == 0:
+                    print("{}/{} (epoch {}), train_loss = {:.3f}, time/batch = {:.3f}" \
+                        .format(e * data_loader.num_batches + b,
+                                args.num_epochs * data_loader.num_batches,
+                                e, train_loss, speed))
+                if (e * data_loader.num_batches + b) % args.save_every == 0 \
+                        or (e==args.num_epochs-1 and b == data_loader.num_batches-1): # save for the last result
+                    checkpoint_path = os.path.join(args.save_dir, 'model.ckpt')
+                    saver.save(sess, checkpoint_path, global_step = e * data_loader.num_batches + b)
+                    print("model saved to {}".format(checkpoint_path))
 
-    logits = tf.contrib.layers.fully_connected(outputs, vocab_size, activation_fn=None)
-    probs = tf.nn.softmax(logits, name='probs')
-
-    cost = tf.contrib.seq2seq.sequence_loss(logits, targets, tf.ones[input_text_shape[0], input_text_shape[1]])
-    optimizer = tf.train.AdamOptimizer(LEARNING_RATE)
-
-    gradients = optimizer.compute_gradients(cost)
-    capped_gradients = [(tf.clip_by_value(g, -1., 1.) v) for g, v in gradients if grad is not None]
-    trad_op = optimizer.apply_gradients(capped_gradients)
-
-## TRAINING ##
+if __name__ == '__main__':
+    main()
